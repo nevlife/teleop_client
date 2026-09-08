@@ -1,32 +1,27 @@
 # =============================================================================
-# teleop_client (operator-side): teleop_client + stream_client
-# Python + Qt/PySide GUI.
+# teleop_client (operator-side): native Qt 6 / GStreamer WebRTC client.
 # =============================================================================
 
-# --- Python ------------------------------------------------------------------
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.Python
-*.egg-info/
-dist/
+# --- CMake / build -----------------------------------------------------------
 build/
-.eggs/
-.pytest_cache/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+*.o
+*.so
+*.a
 
-# --- Virtual environments ----------------------------------------------------
-.venv/
-venv/
-env/
-
-# --- Qt / PySide -------------------------------------------------------------
+# --- Qt ----------------------------------------------------------------------
 *.qm
 *.pro.user
+moc_*.cpp
+ui_*.h
 
 # --- IDE / editor ------------------------------------------------------------
 .vscode/
 .idea/
+.cache/
 *.swp
 *.swo
 *~
@@ -38,5 +33,3 @@ Thumbs.db
 # --- Logs / local config -----------------------------------------------------
 *.log
 logs/
-.env
-*.secret

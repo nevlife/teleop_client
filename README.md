@@ -1,61 +1,109 @@
 # teleop_client
 
-> `native_v2/` is the new Qt/GStreamer client. The existing Python/Zenoh UI is
-> retained as a legacy reference during migration.
+Operator-side native client. Qt 6 windows, one per attached display, receiving
+video over WebRTC from [`teleop_rover`](https://github.com/nevlife/teleop_rover)
+and sending control over a WebRTC data channel. Pairing is brokered by
+[`teleop_server`](https://github.com/nevlife/teleop_server).
 
-NEV 텔레오프 시스템의 운전자측 (operator station) 통합 클라이언트
-조이스틱으로 차량을 원격제어하고 텔레메트리·영상을 한 GUI 창에서 본다
+This is not a web client. Zenoh is not a dependency and is not part of the
+client runtime.
 
-## 설치
+## Build
 
-```bash
-cd ~/teleop_client
-git submodule update --init --recursive
-
-uv venv --system-site-packages
-source .venv/bin/activate
-uv pip install -e .
-```
-
-## 실행
+Ubuntu 24.04:
 
 ```bash
-source .venv/bin/activate
-teleop-ui
+sudo apt install cmake ninja-build pkg-config \
+  qt6-base-dev qt6-websockets-dev \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  libgstreamer-plugins-bad1.0-dev \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-libav
 ```
 
-옵션 (필요할 때만):
+`libgstreamer-plugins-bad1.0-dev` supplies the `gstreamer-webrtc-1.0`
+pkg-config module, without which the CMake configure step fails.
+
 ```bash
-teleop-ui --cameras front,rear     # 카메라 override
-teleop-ui -v                        # DEBUG 로그
-teleop-ui --teleop-config teleop_client/config.yaml \
-          --stream-config stream_client/config.yaml
+git clone --recurse-submodules https://github.com/nevlife/teleop_client.git
+cd teleop_client
+cmake -S native_v2 -B build/native_v2 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build/native_v2
 ```
 
-## 디렉토리
+## Test
 
-```
-teleop_client/                    # repo root (= 단일 pyproject)
-├── pyproject.toml
-├── teleop_ui/                    # 통합 엔트리 (한 윈도우)
-│   └── teleop_ui/main.py
-├── teleop_client/                # 텔레메트리·제어 모듈
-│   ├── teleop_client/            (controller/, gui/, client.py, send_loop.py …)
-│   ├── config.yaml
-│   ├── controller_main.py        # 헤드리스 joystick-only 디버그용
-│   └── teleop_contracts/         # git submodule
-└── stream_client/                # 영상 모듈
-    ├── stream_client/            (gui/, client.py, gstreamer_tcp.py …)
-    ├── config.yaml
-    ├── viewer_h265_tcp.py        # 빠른 영상-only 뷰어
-    └── test/
+```bash
+ctest --test-dir build/native_v2 --output-on-failure
 ```
 
-세 Python 패키지(`teleop_client` / `stream_client` / `teleop_ui`)는 모두
-top-level `pyproject.toml` 하나로 같이 install 되며, 진짜 엔트리는
-`teleop-ui` 하나. 디버깅용 보조 entry point 2개 (`controller_main.py`,
-`viewer_h265_tcp.py`) 는 직접 실행.
+Tests need `libgtest-dev`; without it the test target is skipped and the client
+still builds.
 
-## 와이어 컨트랙트
+## Run
 
-[`teleop_contracts`](https://github.com/nevlife/teleop_contracts) 를 `teleop_client/teleop_contracts/` 에 git submodule 로 pin
+```bash
+./build/native_v2/teleop-client-v2 --server ws://SERVER:13437/ws --robot rover-01
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--server` | `ws://127.0.0.1:13437/ws` | Signaling WebSocket URL |
+| `--robot` | `rover-01` | Robot identifier to pair with |
+| `--fullscreen` | off | One fullscreen window per monitor |
+
+## Keyboard control
+
+The window must have focus for any command to be produced.
+
+| Key | Action |
+|---|---|
+| `Space` | Deadman — commands are produced **only while it is held** |
+| `W` / `S` | Forward / reverse |
+| `A` / `D` | Yaw left / right |
+
+A key is binary, unlike an analog stick, so the target implied by the held keys
+is approached at the configured acceleration limits rather than stepped to
+directly. Deceleration is deliberately faster than acceleration.
+
+Motion ramps to a stop whenever:
+
+- the deadman is released;
+- the window loses focus (every held key is dropped, because Qt delivers no
+  key-up for keys that were down at that moment);
+- the window regains focus (keys held at that moment are not inherited, so an
+  operator cannot drive by alt-tabbing in with the deadman pressed).
+
+Bound keys are consumed by the application event filter, so `Space` never
+activates whichever button holds focus.
+
+The limits live in `KeyboardConfig` (`native_v2/include/teleop_client_v2/keyboard_input.hpp`).
+E-stop is not bound to the keyboard.
+
+## Layout
+
+```
+teleop_client/
+├── native_v2/
+│   ├── include/teleop_client_v2/
+│   │   ├── codec_probe.hpp
+│   │   ├── keyboard_input.hpp     # Qt-free input core
+│   │   └── signaling_client.hpp
+│   ├── src/
+│   │   ├── codec_probe.cpp        # runtime H.264 / VP9 / AV1 decoder probe
+│   │   ├── keyboard_input.cpp
+│   │   ├── main.cpp               # windows, Qt key bridge, input tick
+│   │   └── signaling_client.cpp   # WebSocket signaling + SDP/ICE hooks
+│   └── test/keyboard_input_test.cpp
+└── teleop_contracts/              # git submodule: v2 wire contract
+```
+
+## Status
+
+Implemented: per-display Qt windows, decoder probing, the signaling handshake
+with strict single-client pairing, SDP/ICE hooks, and the keyboard input core.
+
+Not yet implemented: the `webrtcbin` pipeline that renders the video track, and
+the data channels that carry `MotionCommand` and telemetry. The motion command
+is currently displayed in the window rather than transmitted — the placeholder
+does not pretend the media or control path is ready.
