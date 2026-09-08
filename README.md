@@ -1,5 +1,8 @@
 # teleop_client
 
+> `native_v2/` is the new Qt/GStreamer client. The existing Python/Zenoh UI is
+> retained as a legacy reference during migration.
+
 NEV 텔레오프 시스템의 운전자측 (operator station) 통합 클라이언트
 조이스틱으로 차량을 원격제어하고 텔레메트리·영상을 한 GUI 창에서 본다
 
