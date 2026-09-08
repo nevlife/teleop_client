@@ -92,8 +92,14 @@ private:
   teleop_client_v2::KeyboardInput & input_;
 };
 
-QString describe(const teleop_client_v2::DriveCommand & command)
+/// The link state leads, because the command is computed locally whether or
+/// not anything receives it. Showing a speed first made a client with no
+/// rover behind it read as though the vehicle were moving.
+QString describe(const teleop_client_v2::DriveCommand & command, bool control_linked)
 {
+  if (!control_linked) {
+    return QStringLiteral("NO CONTROL LINK — commands are not reaching the rover");
+  }
   if (!command.deadman) {
     return QStringLiteral("HOLD — press and hold SPACE to drive (W/S, A/D)");
   }
@@ -189,7 +195,7 @@ int main(int argc, char ** argv)
     auto * layout = new QVBoxLayout(central);
     auto * title = new QLabel(QString("TELEOP V2 — DISPLAY %1").arg(index + 1), central);
     auto * video = new teleop_client_v2::VideoView(central);
-    auto * drive = new QLabel(describe({}), central);
+    auto * drive = new QLabel(describe({}, false), central);
     auto * status = new QLabel("signaling disconnected", central);
     title->setStyleSheet("font-size: 24px; font-weight: 700");
     drive->setStyleSheet("font-size: 16px; font-family: monospace");
@@ -230,10 +236,9 @@ int main(int argc, char ** argv)
       const double dt = static_cast<double>(clock.restart()) / 1000.0;
       const auto command = input.poll(dt);
 
-      QString text = describe(command);
-      if (!session.control_open()) {
-        text += "   [no control link]";
-      } else {
+      const bool linked = session.control_open();
+      const QString text = describe(command, linked);
+      if (linked) {
         nev::teleop::v2::MotionCommand wire;
         wire.set_robot_id(robot.toStdString());
         wire.set_session_id(session_id->toStdString());
