@@ -24,6 +24,10 @@ public:
 
 signals:
   void status_changed(const QString & status);
+  /// Relay credentials from hello_ack. Emitted before `peer_ready`, so the
+  /// media session can be configured before the offer arrives.
+  void turn_offered(
+    const QString & url, const QString & username, const QString & credential);
   void peer_ready(const QString & session_id, std::uint64_t epoch, bool create_offer);
   void offer_received(const QString & sdp);
   void answer_received(const QString & sdp);

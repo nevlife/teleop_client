@@ -1,5 +1,6 @@
 #include "teleop_client_v2/signaling_client.hpp"
 
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QtGlobal>
@@ -74,6 +75,14 @@ void SignalingClient::on_text_message(const QString & text)
   const auto object = document.object();
   const auto type = object.value("type").toString();
   if (type == "hello_ack") {
+    const auto turn = object.value("turn").toObject();
+    const auto urls = turn.value("urls").toArray();
+    if (!urls.isEmpty()) {
+      emit turn_offered(
+        urls.first().toString(),
+        turn.value("username").toString(),
+        turn.value("credential").toString());
+    }
     emit status_changed("waiting for rover");
   } else if (type == "peer_ready") {
     emit peer_ready(

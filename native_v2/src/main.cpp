@@ -1,8 +1,12 @@
 #include "teleop_client_v2/codec_probe.hpp"
 #include "teleop_client_v2/keyboard_input.hpp"
 #include "teleop_client_v2/signaling_client.hpp"
+#include "teleop_client_v2/video_view.hpp"
+#include "teleop_client_v2/webrtc_session.hpp"
 
 #include <gst/gst.h>
+
+#include "teleop/v2/control.pb.h"
 
 #include <QApplication>
 #include <QCommandLineOption>
@@ -12,6 +16,7 @@
 #include <QGuiApplication>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QMetaType>
 #include <QMainWindow>
 #include <QObject>
 #include <QScreen>
@@ -19,6 +24,8 @@
 #include <QVBoxLayout>
 #include <QWindow>
 
+#include <chrono>
+#include <cstdio>
 #include <memory>
 #include <vector>
 
@@ -29,6 +36,11 @@ namespace
 /// rover's ControlGuard watchdog is 250 ms, so commands must leave well
 /// inside that.
 constexpr int kInputTickMs = 20;
+
+/// How long the rover may honour a command. Must not exceed the rover's
+/// watchdog, so a command stuck in a queue expires before the guard would
+/// already have given up on the link.
+constexpr int kCommandValidForMs = 200;
 
 /// Maps a Qt key onto a control intent. Returns false for anything unbound.
 bool action_for_key(int key, teleop_client_v2::DriveAction & action)
@@ -113,6 +125,50 @@ int main(int argc, char ** argv)
 
   teleop_client_v2::SignalingClient signaling(
     QUrl(parser.value("server")), parser.value("robot"));
+  teleop_client_v2::WebRtcSession session;
+
+  // Both signaling and media report through the same line on stdout, so a
+  // headless run says what happened without a window to read.
+  const auto log = [](const QString & line) {
+      std::fprintf(stdout, "teleop-client: %s\n", qUtf8Printable(line));
+      std::fflush(stdout);
+    };
+  QObject::connect(
+    &signaling, &teleop_client_v2::SignalingClient::status_changed, &app, log);
+  QObject::connect(
+    &session, &teleop_client_v2::WebRtcSession::status_changed, &app, log);
+
+  // Session identity from pairing. Every MotionCommand carries it, and the
+  // rover's ControlGuard rejects anything from another session or epoch.
+  auto session_id = std::make_shared<QString>();
+  auto session_epoch = std::make_shared<quint64>(0);
+  auto sequence = std::make_shared<quint64>(0);
+  QObject::connect(
+    &signaling, &teleop_client_v2::SignalingClient::peer_ready, &app,
+    [session_id, session_epoch, sequence](const QString & id, std::uint64_t epoch, bool) {
+      *session_id = id;
+      *session_epoch = epoch;
+      // Sequence numbers must increase within a session; a new session starts
+      // over, which the new epoch makes unambiguous.
+      *sequence = 0;
+    });
+
+  // The rover is always the offerer, so this side only ever answers.
+  QObject::connect(
+    &signaling, &teleop_client_v2::SignalingClient::turn_offered,
+    &session, &teleop_client_v2::WebRtcSession::set_turn);
+  QObject::connect(
+    &signaling, &teleop_client_v2::SignalingClient::offer_received,
+    &session, &teleop_client_v2::WebRtcSession::handle_offer);
+  QObject::connect(
+    &signaling, &teleop_client_v2::SignalingClient::ice_received,
+    &session, &teleop_client_v2::WebRtcSession::handle_ice);
+  QObject::connect(
+    &session, &teleop_client_v2::WebRtcSession::answer_ready,
+    &signaling, &teleop_client_v2::SignalingClient::send_answer);
+  QObject::connect(
+    &session, &teleop_client_v2::WebRtcSession::ice_ready,
+    &signaling, &teleop_client_v2::SignalingClient::send_ice);
 
   teleop_client_v2::KeyboardInput input;
   auto * bridge = new KeyboardBridge(input, &app);
@@ -132,13 +188,10 @@ int main(int argc, char ** argv)
     auto * central = new QWidget(window.get());
     auto * layout = new QVBoxLayout(central);
     auto * title = new QLabel(QString("TELEOP V2 — DISPLAY %1").arg(index + 1), central);
-    auto * video = new QLabel("Waiting for WebRTC video track", central);
+    auto * video = new teleop_client_v2::VideoView(central);
     auto * drive = new QLabel(describe({}), central);
     auto * status = new QLabel("signaling disconnected", central);
     title->setStyleSheet("font-size: 24px; font-weight: 700");
-    video->setAlignment(Qt::AlignCenter);
-    video->setStyleSheet("background: #111; color: #aaa; font-size: 20px");
-    video->setMinimumSize(640, 360);
     drive->setStyleSheet("font-size: 16px; font-family: monospace");
     layout->addWidget(title);
     layout->addWidget(video, 1);
@@ -155,25 +208,87 @@ int main(int argc, char ** argv)
     } else {
       window->show();
     }
+    // Every display shows the same track; the frame is copied into each
+    // view rather than decoded more than once.
+    QObject::connect(
+      &session, &teleop_client_v2::WebRtcSession::frame_ready,
+      video, &teleop_client_v2::VideoView::submit_frame);
+    QObject::connect(
+      &session, &teleop_client_v2::WebRtcSession::status_changed,
+      status, &QLabel::setText);
     drive_labels.push_back(drive);
     windows.push_back(std::move(window));
   }
 
-  // The motion command is only displayed for now; wiring it to the control
-  // data channel is the next milestone.
   QElapsedTimer clock;
   clock.start();
   QTimer input_timer;
   QObject::connect(
-    &input_timer, &QTimer::timeout, &app, [&input, &drive_labels, &clock]() {
+    &input_timer, &QTimer::timeout, &app,
+    [&input, &drive_labels, &clock, &session, robot = parser.value("robot"),
+    session_id, session_epoch, sequence]() {
       const double dt = static_cast<double>(clock.restart()) / 1000.0;
       const auto command = input.poll(dt);
-      const auto text = describe(command);
+
+      QString text = describe(command);
+      if (!session.control_open()) {
+        text += "   [no control link]";
+      } else {
+        nev::teleop::v2::MotionCommand wire;
+        wire.set_robot_id(robot.toStdString());
+        wire.set_session_id(session_id->toStdString());
+        wire.set_session_epoch(*session_epoch);
+        wire.set_sequence(++*sequence);
+        wire.set_sent_unix_ns(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+        wire.set_valid_for_ms(kCommandValidForMs);
+        wire.set_linear_mps(static_cast<float>(command.linear_mps));
+        wire.set_angular_rps(static_cast<float>(command.angular_rps));
+        wire.set_deadman(command.deadman);
+
+        std::string encoded;
+        if (wire.SerializeToString(&encoded)) {
+          session.send_control(QByteArray(encoded.data(), static_cast<int>(encoded.size())));
+        }
+      }
+
       for (auto * label : drive_labels) {
         label->setText(text);
       }
     });
   input_timer.start(kInputTickMs);
+
+  // Frame accounting, reported once a second. Without it a headless run
+  // cannot distinguish "negotiated" from "actually receiving pictures".
+  auto frames = std::make_shared<int>(0);
+  auto geometry = std::make_shared<QString>();
+  QObject::connect(
+    &session, &teleop_client_v2::WebRtcSession::frame_ready, &app,
+    [frames, geometry](const QImage & frame) {
+      ++*frames;
+      *geometry = QString("%1x%2").arg(frame.width()).arg(frame.height());
+    });
+  QTimer frame_report;
+  QObject::connect(
+    &frame_report, &QTimer::timeout, &app, [frames, geometry, &log]() {
+      if (*frames > 0) {
+        log(QString("video %1 at %2 fps").arg(*geometry).arg(*frames));
+        *frames = 0;
+      }
+    });
+  frame_report.start(1000);
+
+  // The drive state is on the window, but a headless run needs it on stdout
+  // too, and it is the only way to see whether commands are leaving.
+  QTimer drive_report;
+  QObject::connect(
+    &drive_report, &QTimer::timeout, &app, [&session, &input, &log]() {
+      log(QString("control %1, %2")
+      .arg(session.control_open() ? "link up" : "link down")
+      .arg(input.focused() ? "window focused" : "window not focused"));
+    });
+  drive_report.start(2000);
 
   signaling.connect_to_server();
   return app.exec();
